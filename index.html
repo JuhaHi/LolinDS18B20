@@ -3,13 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ESP32-S3 Lämpötilaloggeri (BLE)</title>
+  <title>ESP32-S3 Lämpötilaloggeri (BLE Live)</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
   <style>
     :root {
       --primary: #0284c7;
       --primary-hover: #0369a1;
+      --success: #16a34a;
       --danger: #dc2626;
       --danger-hover: #b91c1c;
       --bg: #f1f5f9;
@@ -81,6 +82,7 @@
     }
     button:hover { background: var(--primary-hover); }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.connected { background: var(--success); }
     button.secondary { background: #475569; }
     button.secondary:hover { background: #334155; }
     button.danger { background: var(--danger); }
@@ -124,12 +126,12 @@
       </div>
 
       <div class="actions">
-        <button id="btnConnect">Hae historia (BLE)</button>
+        <button id="btnConnect">Yhdistä &amp; Hae historia (BLE)</button>
         <button id="btnCsv" class="secondary" style="display:none;">Lataa CSV</button>
         <button id="btnClear" class="danger" style="display:none;">Tyhjennä muisti</button>
       </div>
     </div>
-    <div id="status">Valmis yhdistämään. Paina "Hae historia (BLE)" ja valitse listalta <strong>ESP32-TempLogger</strong>.</div>
+    <div id="status">Valmis yhdistämään. Paina "Yhdistä &amp; Hae historia (BLE)" ja valitse <strong>ESP32-TempLogger</strong>.</div>
   </div>
 
   <div class="card">
@@ -149,20 +151,35 @@
     const DATA_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
     const CTRL_CHAR_UUID = "1c95d5e3-d8f7-413a-bf3d-7a2e5d7be87e";
 
+    let bleDevice = null;
+    let ctrlCharacteristic = null;
     let rawRecords = [];
     let chart = null;
 
-    // Päivitä nykyinen kellonaika ruudulle sekunnin välein
     function updateClock() {
       document.getElementById('currentTime').textContent = new Date().toLocaleString('fi-FI');
     }
     updateClock();
     setInterval(updateClock, 1000);
 
-    // Yhdistä BLE-laitteeseen, synkronoi aika ja lataa koko historia
+    function setDisconnectedUI(msg) {
+      const btn = document.getElementById('btnConnect');
+      btn.textContent = "Yhdistä & Hae historia (BLE)";
+      btn.classList.remove('connected');
+      btn.disabled = false;
+      if (msg) document.getElementById('status').textContent = msg;
+    }
+
     document.getElementById('btnConnect').addEventListener('click', async () => {
       const statusEl = document.getElementById('status');
       const btnConnect = document.getElementById('btnConnect');
+
+      // Jos yhteys on jo päällä, nappi toimii katkaisupainikkeena
+      if (bleDevice && bleDevice.gatt.connected) {
+        bleDevice.gatt.disconnect();
+        setDisconnectedUI("Bluetooth-yhteys katkaistu.");
+        return;
+      }
 
       if (!navigator.bluetooth) {
         statusEl.textContent = "Virhe: Selain ei tue Web Bluetoothia. Käytä Chromea tai Edgeä.";
@@ -173,16 +190,20 @@
         btnConnect.disabled = true;
         statusEl.textContent = "Etsitään ESP32-TempLogger-laitetta...";
 
-        const device = await navigator.bluetooth.requestDevice({
+        bleDevice = await navigator.bluetooth.requestDevice({
           filters: [{ name: 'ESP32-TempLogger' }],
           optionalServices: [SERVICE_UUID]
         });
 
+        bleDevice.addEventListener('gattserverdisconnected', () => {
+          setDisconnectedUI("Bluetooth-yhteys katkesi.");
+        });
+
         statusEl.textContent = "Yhdistetään laitteeseen...";
-        const server = await device.gatt.connect();
+        const server = await bleDevice.gatt.connect();
         const service = await server.getPrimaryService(SERVICE_UUID);
         const dataChar = await service.getCharacteristic(DATA_CHAR_UUID);
-        const ctrlChar = await service.getCharacteristic(CTRL_CHAR_UUID);
+        ctrlCharacteristic = await service.getCharacteristic(CTRL_CHAR_UUID);
 
         rawRecords = [];
         await dataChar.startNotifications();
@@ -194,25 +215,45 @@
           if (dv.byteLength === 8 && dv.getUint8(0) === 0xAA && dv.getUint8(1) === 0x55) {
             const nowTemp = dv.getInt16(6, true) / 100.0;
             document.getElementById('currentTemp').textContent = `${nowTemp.toFixed(2)} °C`;
-            statusEl.textContent = "Aika synkronoitu. Ladataan mittaushistoriaa muistista...";
+            statusEl.textContent = "Aika synkronoitu. Ladataan mittaushistoriaa...";
             return;
           }
 
-          // 2. Lopetuspaketti (2 tavua: 0xFF, 0xFF)
+          // 2. Lopetuspaketti historialataukselle (2 tavua: 0xFF, 0xFF) -> Jätetään yhteys auki live-tilaan!
           if (dv.byteLength === 2 && dv.getUint8(0) === 0xFF && dv.getUint8(1) === 0xFF) {
-            // Järjestä aikajärjestykseen varmuuden vuoksi
             rawRecords.sort((a, b) => a.x - b.x);
-            statusEl.textContent = `Valmis! Ladattu ${rawRecords.length} mittausta (${new Date().toLocaleTimeString('fi-FI')}).`;
+            statusEl.textContent = `Live-tila päällä! Ladattu ${rawRecords.length} mittausta. Uudet mittaukset päivittyvät automaattisesti.`;
             updateStats();
             renderChart();
             document.getElementById('btnCsv').style.display = 'inline-block';
             document.getElementById('btnClear').style.display = 'inline-block';
+            btnConnect.textContent = "Live päällä (Katkaise yhteys)";
+            btnConnect.classList.add('connected');
             btnConnect.disabled = false;
-            device.gatt.disconnect();
             return;
           }
 
-          // 3. Datapaketit (7 tavua per tietue: uint32 timestamp, int16 temp, uint8 isSynced)
+          // 3. Yksittäinen live-mittaus (7 tavua: 0xBB, uint32 timestamp, int16 temp)
+          if (dv.byteLength === 7 && dv.getUint8(0) === 0xBB) {
+            const liveEpoch = dv.getUint32(1, true);
+            const liveTemp = dv.getInt16(5, true) / 100.0;
+            const liveDate = new Date(liveEpoch * 1000);
+
+            document.getElementById('currentTemp').textContent = `${liveTemp.toFixed(2)} °C`;
+            rawRecords.push({ x: liveDate, y: liveTemp });
+            updateStats();
+
+            if (chart) {
+              chart.data.datasets[0].pointRadius = rawRecords.length > 400 ? 0 : 2.5;
+              chart.update('none');
+            } else {
+              renderChart();
+            }
+            statusEl.textContent = `Live-päivitys vastaanotettu klo ${liveDate.toLocaleTimeString('fi-FI')} (${liveTemp.toFixed(2)} °C). Yhteensä ${rawRecords.length} mittausta.`;
+            return;
+          }
+
+          // 4. Historiapaketit (7 tavua per tietue: uint32 timestamp, int16 temp, uint8 isSynced)
           for (let offset = 0; offset + 7 <= dv.byteLength; offset += 7) {
             const recEpoch = dv.getUint32(offset, true);
             const recTemp = dv.getInt16(offset + 4, true) / 100.0;
@@ -222,45 +263,45 @@
           statusEl.textContent = `Vastaanotettu ${rawRecords.length} mittausta...`;
         });
 
-        // Lähetä nykyinen Unix-aika sekunteina ja pyydä historia
         const nowEpochSec = Math.floor(Date.now() / 1000);
-        await ctrlChar.writeValue(new TextEncoder().encode(`SYNC:${nowEpochSec}`));
+        await ctrlCharacteristic.writeValue(new TextEncoder().encode(`SYNC:${nowEpochSec}`));
 
       } catch (err) {
-        statusEl.textContent = "Yhteys keskeytyi tai epäonnistui: " + err.message;
-        btnConnect.disabled = false;
+        setDisconnectedUI("Yhteys epäonnistui: " + err.message);
       }
     });
 
-    // Muistin tyhjennys ESP32-kortilta
+    // Muistin tyhjennys suoraan aktiivisen yhteyden yli (tai yhdistämällä)
     document.getElementById('btnClear').addEventListener('click', async () => {
       if (!confirm("Haluatko varmasti tyhjentää koko mittaushistorian ESP32-kortin muistista?")) return;
       const statusEl = document.getElementById('status');
       try {
-        statusEl.textContent = "Yhdistetään muistin tyhjennystä varten...";
-        const device = await navigator.bluetooth.requestDevice({
-          filters: [{ name: 'ESP32-TempLogger' }],
-          optionalServices: [SERVICE_UUID]
-        });
-        const server = await device.gatt.connect();
-        const service = await server.getPrimaryService(SERVICE_UUID);
-        const ctrlChar = await service.getCharacteristic(CTRL_CHAR_UUID);
-
-        await ctrlChar.writeValue(new TextEncoder().encode("CLEAR"));
-        device.gatt.disconnect();
+        if (bleDevice && bleDevice.gatt.connected && ctrlCharacteristic) {
+          await ctrlCharacteristic.writeValue(new TextEncoder().encode("CLEAR"));
+        } else {
+          statusEl.textContent = "Yhdistetään muistin tyhjennystä varten...";
+          const device = await navigator.bluetooth.requestDevice({
+            filters: [{ name: 'ESP32-TempLogger' }],
+            optionalServices: [SERVICE_UUID]
+          });
+          const server = await device.gatt.connect();
+          const service = await server.getPrimaryService(SERVICE_UUID);
+          const ctrlChar = await service.getCharacteristic(CTRL_CHAR_UUID);
+          await ctrlChar.writeValue(new TextEncoder().encode("CLEAR"));
+          device.gatt.disconnect();
+        }
 
         rawRecords = [];
         if (chart) chart.destroy();
+        chart = null;
         document.getElementById('statsBar').style.display = 'none';
         document.getElementById('btnCsv').style.display = 'none';
-        document.getElementById('btnClear').style.display = 'none';
         statusEl.textContent = "ESP32-kortin mittaushistoria tyhjennetty.";
       } catch (err) {
         statusEl.textContent = "Tyhjennys epäonnistui: " + err.message;
       }
     });
 
-    // Laske minimi, maksimi ja keskiarvo
     function updateStats() {
       if (rawRecords.length === 0) return;
       let min = Infinity, max = -Infinity, sum = 0;
@@ -276,7 +317,6 @@
       document.getElementById('statsBar').style.display = 'flex';
     }
 
-    // Piirrä Chart.js-graafi
     function renderChart() {
       const ctx = document.getElementById('tempChart').getContext('2d');
       if (chart) chart.destroy();
@@ -324,7 +364,6 @@
       });
     }
 
-    // Lataa tulokset suomalaisella puolipiste-erottimella (aukeaa suoraan Excelissä)
     document.getElementById('btnCsv').addEventListener('click', () => {
       let csv = "Aikaleima;Lampotila_C\n";
       for (const r of rawRecords) {
