@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32-S3 Lämpötilaloggeri (BLE)</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+  <style>
+    :root {
+      --primary: #0284c7;
+      --primary-hover: #0369a1;
+      --danger: #dc2626;
+      --danger-hover: #b91c1c;
+      --bg: #f1f5f9;
+      --card: #ffffff;
+      --text: #0f172a;
+      --muted: #64748b;
+    }
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      max-width: 1050px;
+      margin: 24px auto;
+      padding: 0 16px;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .card {
+      background: var(--card);
+      padding: 20px 24px;
+      border-radius: 12px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+      margin-bottom: 20px;
+    }
+    .header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 20px;
+    }
+    .metrics {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 28px;
+      align-items: baseline;
+    }
+    .metric-label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .temp-now {
+      font-size: 2.6rem;
+      font-weight: 700;
+      color: var(--primary);
+      line-height: 1;
+    }
+    .time-now {
+      font-size: 1.25rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    button {
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      padding: 11px 18px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    button:hover { background: var(--primary-hover); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary { background: #475569; }
+    button.secondary:hover { background: #334155; }
+    button.danger { background: var(--danger); }
+    button.danger:hover { background: var(--danger-hover); }
+    #status {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid #e2e8f0;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+    .stats-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 24px;
+      margin-bottom: 16px;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+    .stats-bar strong { color: var(--text); }
+    .chart-wrapper {
+      position: relative;
+      height: 420px;
+      width: 100%;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="card">
+    <div class="header">
+      <div class="metrics">
+        <div>
+          <div class="metric-label">Lämpötila nyt</div>
+          <div class="temp-now" id="currentTemp">--.- °C</div>
+        </div>
+        <div>
+          <div class="metric-label">Tämänhetkinen aika</div>
+          <div class="time-now" id="currentTime">--.--.---- --:--:--</div>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="btnConnect">Hae historia (BLE)</button>
+        <button id="btnCsv" class="secondary" style="display:none;">Lataa CSV</button>
+        <button id="btnClear" class="danger" style="display:none;">Tyhjennä muisti</button>
+      </div>
+    </div>
+    <div id="status">Valmis yhdistämään. Paina "Hae historia (BLE)" ja valitse listalta <strong>ESP32-TempLogger</strong>.</div>
+  </div>
+
+  <div class="card">
+    <div class="stats-bar" id="statsBar" style="display:none;">
+      <span>Mittauksia: <strong id="statCount">0</strong></span>
+      <span>Min: <strong id="statMin">--</strong></span>
+      <span>Max: <strong id="statMax">--</strong></span>
+      <span>Keskiarvo: <strong id="statAvg">--</strong></span>
+    </div>
+    <div class="chart-wrapper">
+      <canvas id="tempChart"></canvas>
+    </div>
+  </div>
+
+  <script>
+    const SERVICE_UUID   = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+    const DATA_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+    const CTRL_CHAR_UUID = "1c95d5e3-d8f7-413a-bf3d-7a2e5d7be87e";
+
+    let rawRecords = [];
+    let chart = null;
+
+    // Päivitä nykyinen kellonaika ruudulle sekunnin välein
+    function updateClock() {
+      document.getElementById('currentTime').textContent = new Date().toLocaleString('fi-FI');
+    }
+    updateClock();
+    setInterval(updateClock, 1000);
+
+    // Yhdistä BLE-laitteeseen, synkronoi aika ja lataa koko historia
+    document.getElementById('btnConnect').addEventListener('click', async () => {
+      const statusEl = document.getElementById('status');
+      const btnConnect = document.getElementById('btnConnect');
+
+      if (!navigator.bluetooth) {
+        statusEl.textContent = "Virhe: Selain ei tue Web Bluetoothia. Käytä Chromea tai Edgeä.";
+        return;
+      }
+
+      try {
+        btnConnect.disabled = true;
+        statusEl.textContent = "Etsitään ESP32-TempLogger-laitetta...";
+
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ name: 'ESP32-TempLogger' }],
+          optionalServices: [SERVICE_UUID]
+        });
+
+        statusEl.textContent = "Yhdistetään laitteeseen...";
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        const dataChar = await service.getCharacteristic(DATA_CHAR_UUID);
+        const ctrlChar = await service.getCharacteristic(CTRL_CHAR_UUID);
+
+        rawRecords = [];
+        await dataChar.startNotifications();
+
+        dataChar.addEventListener('characteristicvaluechanged', (event) => {
+          const dv = event.target.value;
+
+          // 1. Otsikkopaketti (8 tavua: 0xAA, 0x55, uint32 nowEpoch, int16 currentTemp)
+          if (dv.byteLength === 8 && dv.getUint8(0) === 0xAA && dv.getUint8(1) === 0x55) {
+            const nowTemp = dv.getInt16(6, true) / 100.0;
+            document.getElementById('currentTemp').textContent = `${nowTemp.toFixed(2)} °C`;
+            statusEl.textContent = "Aika synkronoitu. Ladataan mittaushistoriaa muistista...";
+            return;
+          }
+
+          // 2. Lopetuspaketti (2 tavua: 0xFF, 0xFF)
+          if (dv.byteLength === 2 && dv.getUint8(0) === 0xFF && dv.getUint8(1) === 0xFF) {
+            // Järjestä aikajärjestykseen varmuuden vuoksi
+            rawRecords.sort((a, b) => a.x - b.x);
+            statusEl.textContent = `Valmis! Ladattu ${rawRecords.length} mittausta (${new Date().toLocaleTimeString('fi-FI')}).`;
+            updateStats();
+            renderChart();
+            document.getElementById('btnCsv').style.display = 'inline-block';
+            document.getElementById('btnClear').style.display = 'inline-block';
+            btnConnect.disabled = false;
+            device.gatt.disconnect();
+            return;
+          }
+
+          // 3. Datapaketit (7 tavua per tietue: uint32 timestamp, int16 temp, uint8 isSynced)
+          for (let offset = 0; offset + 7 <= dv.byteLength; offset += 7) {
+            const recEpoch = dv.getUint32(offset, true);
+            const recTemp = dv.getInt16(offset + 4, true) / 100.0;
+            const timestamp = new Date(recEpoch * 1000);
+            rawRecords.push({ x: timestamp, y: recTemp });
+          }
+          statusEl.textContent = `Vastaanotettu ${rawRecords.length} mittausta...`;
+        });
+
+        // Lähetä nykyinen Unix-aika sekunteina ja pyydä historia
+        const nowEpochSec = Math.floor(Date.now() / 1000);
+        await ctrlChar.writeValue(new TextEncoder().encode(`SYNC:${nowEpochSec}`));
+
+      } catch (err) {
+        statusEl.textContent = "Yhteys keskeytyi tai epäonnistui: " + err.message;
+        btnConnect.disabled = false;
+      }
+    });
+
+    // Muistin tyhjennys ESP32-kortilta
+    document.getElementById('btnClear').addEventListener('click', async () => {
+      if (!confirm("Haluatko varmasti tyhjentää koko mittaushistorian ESP32-kortin muistista?")) return;
+      const statusEl = document.getElementById('status');
+      try {
+        statusEl.textContent = "Yhdistetään muistin tyhjennystä varten...";
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ name: 'ESP32-TempLogger' }],
+          optionalServices: [SERVICE_UUID]
+        });
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        const ctrlChar = await service.getCharacteristic(CTRL_CHAR_UUID);
+
+        await ctrlChar.writeValue(new TextEncoder().encode("CLEAR"));
+        device.gatt.disconnect();
+
+        rawRecords = [];
+        if (chart) chart.destroy();
+        document.getElementById('statsBar').style.display = 'none';
+        document.getElementById('btnCsv').style.display = 'none';
+        document.getElementById('btnClear').style.display = 'none';
+        statusEl.textContent = "ESP32-kortin mittaushistoria tyhjennetty.";
+      } catch (err) {
+        statusEl.textContent = "Tyhjennys epäonnistui: " + err.message;
+      }
+    });
+
+    // Laske minimi, maksimi ja keskiarvo
+    function updateStats() {
+      if (rawRecords.length === 0) return;
+      let min = Infinity, max = -Infinity, sum = 0;
+      for (const r of rawRecords) {
+        if (r.y < min) min = r.y;
+        if (r.y > max) max = r.y;
+        sum += r.y;
+      }
+      document.getElementById('statCount').textContent = rawRecords.length;
+      document.getElementById('statMin').textContent = `${min.toFixed(2)} °C`;
+      document.getElementById('statMax').textContent = `${max.toFixed(2)} °C`;
+      document.getElementById('statAvg').textContent = `${(sum / rawRecords.length).toFixed(2)} °C`;
+      document.getElementById('statsBar').style.display = 'flex';
+    }
+
+    // Piirrä Chart.js-graafi
+    function renderChart() {
+      const ctx = document.getElementById('tempChart').getContext('2d');
+      if (chart) chart.destroy();
+
+      chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          datasets: [{
+            label: 'Lämpötila (°C)',
+            data: rawRecords,
+            borderColor: '#0284c7',
+            backgroundColor: 'rgba(2, 132, 199, 0.12)',
+            borderWidth: 2,
+            pointRadius: rawRecords.length > 400 ? 0 : 2.5,
+            pointHoverRadius: 5,
+            fill: true,
+            tension: 0.15
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: {
+            mode: 'index',
+            intersect: false
+          },
+          scales: {
+            x: {
+              type: 'time',
+              time: {
+                tooltipFormat: 'dd.MM.yyyy HH:mm:ss',
+                displayFormats: {
+                  minute: 'HH:mm',
+                  hour: 'dd.MM. HH:mm',
+                  day: 'dd.MM.yyyy'
+                }
+              },
+              title: { display: true, text: 'Aika' }
+            },
+            y: {
+              title: { display: true, text: 'Lämpötila (°C)' }
+            }
+          }
+        }
+      });
+    }
+
+    // Lataa tulokset suomalaisella puolipiste-erottimella (aukeaa suoraan Excelissä)
+    document.getElementById('btnCsv').addEventListener('click', () => {
+      let csv = "Aikaleima;Lampotila_C\n";
+      for (const r of rawRecords) {
+        const localTime = r.x.toLocaleString('fi-FI');
+        csv += `${localTime};${r.y.toFixed(2).replace('.', ',')}\n`;
+      }
+      const blob = new Blob(["\uFEFF" + csv], { type: 'text/csv;charset=utf-8;' });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = `lampotilahistoria_${new Date().toISOString().slice(0, 10)}.csv`;
+      link.click();
+    });
+  </script>
+</body>
+</html>
