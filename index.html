@@ -174,7 +174,7 @@
       </label>
       <label>
         <input type="checkbox" id="keepAwake">
-        Pidä näyttö päällä (estää Androidia katkaisemasta BLE:tä)
+        Pidä näyttö päällä (estää laitetta katkaisemasta BLE:tä)
       </label>
       <button id="btnTestAlarm" class="secondary" style="padding: 7px 12px; font-size: 0.85rem;">Testaa hälytys</button>
     </div>
@@ -204,7 +204,7 @@
     let wakeLock = null;
     let swRegistration = null;
 
-    // 1. Rekisteröi Service Worker PWA-asennusta ja Android-ilmoituksia varten
+    // 1. Rekisteröi Service Worker PWA-asennusta ja ilmoituksia varten
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('sw.js').then(reg => {
         swRegistration = reg;
@@ -240,7 +240,7 @@
     highLimitEl.addEventListener('input', saveAlarmSettings);
     lowLimitEl.addEventListener('input', saveAlarmSettings);
 
-    // 4. Wake Lock (estää Androidin näytön sammumisen)
+    // 4. Wake Lock (estää näytön sammumisen)
     document.getElementById('keepAwake').addEventListener('change', async (e) => {
       if (e.target.checked && 'wakeLock' in navigator) {
         try {
@@ -255,7 +255,7 @@
       }
     });
 
-    // 5. Äänimerkki (Web Audio API - ei vaadi erillistä mp3-tiedostoa)
+    // 5. Äänimerkki (Web Audio API)
     function playBeep() {
       try {
         const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -347,7 +347,7 @@
       }
 
       if (!navigator.bluetooth) {
-        statusEl.textContent = "Virhe: Selain ei tue Web Bluetoothia. Käytä Chromea.";
+        statusEl.textContent = "Virhe: Selain ei tue Web Bluetoothia. Käytä Chromea tai Edgeä.";
         return;
       }
 
@@ -380,8 +380,9 @@
         dataChar.addEventListener('characteristicvaluechanged', (event) => {
           const dv = event.target.value;
 
-          // Otsikkopaketti
+          // Otsikkopaketti (0xAA 0x55) - nollaa taulukon, jotta toisen laitteen lataus ei tuplaa pisteitä
           if (dv.byteLength === 8 && dv.getUint8(0) === 0xAA && dv.getUint8(1) === 0x55) {
+            rawRecords = [];
             const nowTemp = dv.getInt16(6, true) / 100.0;
             document.getElementById('currentTemp').textContent = `${nowTemp.toFixed(2)} °C`;
             checkTemperatureAlarm(nowTemp);
@@ -389,7 +390,7 @@
             return;
           }
 
-          // Lopetuspaketti
+          // Lopetuspaketti (0xFF 0xFF)
           if (dv.byteLength === 2 && dv.getUint8(0) === 0xFF && dv.getUint8(1) === 0xFF) {
             rawRecords.sort((a, b) => a.x - b.x);
             statusEl.textContent = `Live-tila päällä! Ladattu ${rawRecords.length} mittausta.`;
@@ -416,6 +417,7 @@
             updateStats();
 
             if (chart) {
+              chart.data.datasets[0].data = rawRecords;
               chart.data.datasets[0].pointRadius = rawRecords.length > 400 ? 0 : 2.5;
               chart.update('none');
             } else {
