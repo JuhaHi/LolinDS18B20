@@ -3,6 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#0284c7">
+  <link rel="manifest" href="manifest.json">
   <title>ESP32-S3 Lämpötilaloggeri (BLE Live)</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
@@ -21,29 +23,33 @@
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       max-width: 1050px;
-      margin: 24px auto;
-      padding: 0 16px;
+      margin: 16px auto;
+      padding: 0 12px;
       background: var(--bg);
       color: var(--text);
     }
     .card {
       background: var(--card);
-      padding: 20px 24px;
+      padding: 18px 20px;
       border-radius: 12px;
       box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
-      margin-bottom: 20px;
+      margin-bottom: 16px;
+    }
+    .card.alarm-active {
+      border: 2px solid var(--danger);
+      background: #fef2f2;
     }
     .header {
       display: flex;
       flex-wrap: wrap;
       justify-content: space-between;
       align-items: center;
-      gap: 20px;
+      gap: 16px;
     }
     .metrics {
       display: flex;
       flex-wrap: wrap;
-      gap: 28px;
+      gap: 24px;
       align-items: baseline;
     }
     .metric-label {
@@ -54,65 +60,83 @@
       margin-bottom: 4px;
     }
     .temp-now {
-      font-size: 2.6rem;
+      font-size: 2.5rem;
       font-weight: 700;
       color: var(--primary);
       line-height: 1;
     }
+    .temp-now.alarm-text { color: var(--danger); }
     .time-now {
-      font-size: 1.25rem;
+      font-size: 1.15rem;
       font-weight: 600;
       color: var(--text);
     }
     .actions {
       display: flex;
       flex-wrap: wrap;
-      gap: 10px;
+      gap: 8px;
     }
     button {
       background: var(--primary);
       color: #fff;
       border: none;
-      padding: 11px 18px;
-      font-size: 0.95rem;
+      padding: 11px 16px;
+      font-size: 0.92rem;
       font-weight: 600;
       border-radius: 8px;
       cursor: pointer;
-      transition: background 0.15s;
     }
     button:hover { background: var(--primary-hover); }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     button.connected { background: var(--success); }
     button.secondary { background: #475569; }
-    button.secondary:hover { background: #334155; }
     button.danger { background: var(--danger); }
-    button.danger:hover { background: var(--danger-hover); }
+    .alarm-controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 14px;
+      font-size: 0.92rem;
+    }
+    .alarm-controls label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 500;
+    }
+    .alarm-controls input[type="number"] {
+      width: 72px;
+      padding: 7px 8px;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      font-size: 0.95rem;
+    }
     #status {
-      margin-top: 14px;
-      padding-top: 12px;
+      margin-top: 12px;
+      padding-top: 10px;
       border-top: 1px solid #e2e8f0;
-      font-size: 0.9rem;
+      font-size: 0.88rem;
       color: var(--muted);
     }
     .stats-bar {
       display: flex;
       flex-wrap: wrap;
-      gap: 24px;
-      margin-bottom: 16px;
-      font-size: 0.9rem;
+      gap: 20px;
+      margin-bottom: 14px;
+      font-size: 0.88rem;
       color: var(--muted);
     }
     .stats-bar strong { color: var(--text); }
     .chart-wrapper {
       position: relative;
-      height: 420px;
+      height: 380px;
       width: 100%;
     }
   </style>
 </head>
 <body>
 
-  <div class="card">
+  <div class="card" id="mainCard">
     <div class="header">
       <div class="metrics">
         <div>
@@ -132,6 +156,28 @@
       </div>
     </div>
     <div id="status">Valmis yhdistämään. Paina "Yhdistä &amp; Hae historia (BLE)" ja valitse <strong>ESP32-TempLogger</strong>.</div>
+  </div>
+
+  <div class="card">
+    <div class="alarm-controls">
+      <label>
+        <input type="checkbox" id="alarmEnabled">
+        <strong>Hälytys päällä</strong>
+      </label>
+      <label>
+        Yläraja (°C):
+        <input type="number" id="highLimit" step="0.5" placeholder="esim. 30">
+      </label>
+      <label>
+        Alaraja (°C):
+        <input type="number" id="lowLimit" step="0.5" placeholder="esim. 5">
+      </label>
+      <label>
+        <input type="checkbox" id="keepAwake">
+        Pidä näyttö päällä (estää Androidia katkaisemasta BLE:tä)
+      </label>
+      <button id="btnTestAlarm" class="secondary" style="padding: 7px 12px; font-size: 0.85rem;">Testaa hälytys</button>
+    </div>
   </div>
 
   <div class="card">
@@ -155,13 +201,133 @@
     let ctrlCharacteristic = null;
     let rawRecords = [];
     let chart = null;
+    let wakeLock = null;
+    let swRegistration = null;
 
+    // 1. Rekisteröi Service Worker PWA-asennusta ja Android-ilmoituksia varten
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('sw.js').then(reg => {
+        swRegistration = reg;
+      }).catch(err => console.warn('SW virhe:', err));
+    }
+
+    // 2. Kello
     function updateClock() {
       document.getElementById('currentTime').textContent = new Date().toLocaleString('fi-FI');
     }
     updateClock();
     setInterval(updateClock, 1000);
 
+    // 3. Hälytysasetusten lataus ja tallennus (localStorage)
+    const alarmEnabledEl = document.getElementById('alarmEnabled');
+    const highLimitEl = document.getElementById('highLimit');
+    const lowLimitEl = document.getElementById('lowLimit');
+
+    alarmEnabledEl.checked = localStorage.getItem('alarmEnabled') === 'true';
+    highLimitEl.value = localStorage.getItem('highLimit') || '';
+    lowLimitEl.value = localStorage.getItem('lowLimit') || '';
+
+    async function saveAlarmSettings() {
+      localStorage.setItem('alarmEnabled', alarmEnabledEl.checked);
+      localStorage.setItem('highLimit', highLimitEl.value);
+      localStorage.setItem('lowLimit', lowLimitEl.value);
+
+      if (alarmEnabledEl.checked && 'Notification' in window && Notification.permission === 'default') {
+        await Notification.requestPermission();
+      }
+    }
+    alarmEnabledEl.addEventListener('change', saveAlarmSettings);
+    highLimitEl.addEventListener('input', saveAlarmSettings);
+    lowLimitEl.addEventListener('input', saveAlarmSettings);
+
+    // 4. Wake Lock (estää Androidin näytön sammumisen)
+    document.getElementById('keepAwake').addEventListener('change', async (e) => {
+      if (e.target.checked && 'wakeLock' in navigator) {
+        try {
+          wakeLock = await navigator.wakeLock.request('screen');
+        } catch (err) {
+          console.warn('WakeLock epäonnistui:', err);
+          e.target.checked = false;
+        }
+      } else if (wakeLock) {
+        await wakeLock.release();
+        wakeLock = null;
+      }
+    });
+
+    // 5. Äänimerkki (Web Audio API - ei vaadi erillistä mp3-tiedostoa)
+    function playBeep() {
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(880, ctx.currentTime);
+        gain.gain.setValueAtTime(0.3, ctx.currentTime);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        setTimeout(() => { osc.stop(); ctx.close(); }, 600);
+      } catch (e) {}
+    }
+
+    // 6. Hälytyksen laukaisu ja tarkistus
+    function triggerNotification(title, body) {
+      playBeep();
+      if ('vibrate' in navigator) navigator.vibrate([400, 200, 400, 200, 600]);
+
+      if ('Notification' in window && Notification.permission === 'granted') {
+        if (swRegistration) {
+          swRegistration.showNotification(title, {
+            body: body,
+            vibrate: [400, 200, 400],
+            tag: 'temp-alarm',
+            renotify: true
+          });
+        } else {
+          new Notification(title, { body: body });
+        }
+      }
+    }
+
+    function checkTemperatureAlarm(tempC) {
+      const card = document.getElementById('mainCard');
+      const tempEl = document.getElementById('currentTemp');
+
+      if (!alarmEnabledEl.checked) {
+        card.classList.remove('alarm-active');
+        tempEl.classList.remove('alarm-text');
+        return;
+      }
+
+      const high = parseFloat(highLimitEl.value);
+      const low = parseFloat(lowLimitEl.value);
+      let alarmMsg = null;
+
+      if (!isNaN(high) && tempC >= high) {
+        alarmMsg = `Lämpötila ${tempC.toFixed(2)} °C ylitti ylärajan (${high} °C)!`;
+      } else if (!isNaN(low) && tempC <= low) {
+        alarmMsg = `Lämpötila ${tempC.toFixed(2)} °C alitti alarajan (${low} °C)!`;
+      }
+
+      if (alarmMsg) {
+        card.classList.add('alarm-active');
+        tempEl.classList.add('alarm-text');
+        triggerNotification("Lämpötilahälytys!", alarmMsg);
+      } else {
+        card.classList.remove('alarm-active');
+        tempEl.classList.remove('alarm-text');
+      }
+    }
+
+    document.getElementById('btnTestAlarm').addEventListener('click', async () => {
+      if ('Notification' in window && Notification.permission !== 'granted') {
+        await Notification.requestPermission();
+      }
+      triggerNotification("Testihälytys", "Lämpötilaloggerin hälytys ja värinä toimivat!");
+    });
+
+    // 7. Web Bluetooth -logiikka
     function setDisconnectedUI(msg) {
       const btn = document.getElementById('btnConnect');
       btn.textContent = "Yhdistä & Hae historia (BLE)";
@@ -174,7 +340,6 @@
       const statusEl = document.getElementById('status');
       const btnConnect = document.getElementById('btnConnect');
 
-      // Jos yhteys on jo päällä, nappi toimii katkaisupainikkeena
       if (bleDevice && bleDevice.gatt.connected) {
         bleDevice.gatt.disconnect();
         setDisconnectedUI("Bluetooth-yhteys katkaistu.");
@@ -182,8 +347,12 @@
       }
 
       if (!navigator.bluetooth) {
-        statusEl.textContent = "Virhe: Selain ei tue Web Bluetoothia. Käytä Chromea tai Edgeä.";
+        statusEl.textContent = "Virhe: Selain ei tue Web Bluetoothia. Käytä Chromea.";
         return;
+      }
+
+      if (alarmEnabledEl.checked && 'Notification' in window && Notification.permission === 'default') {
+        await Notification.requestPermission();
       }
 
       try {
@@ -211,18 +380,19 @@
         dataChar.addEventListener('characteristicvaluechanged', (event) => {
           const dv = event.target.value;
 
-          // 1. Otsikkopaketti (8 tavua: 0xAA, 0x55, uint32 nowEpoch, int16 currentTemp)
+          // Otsikkopaketti
           if (dv.byteLength === 8 && dv.getUint8(0) === 0xAA && dv.getUint8(1) === 0x55) {
             const nowTemp = dv.getInt16(6, true) / 100.0;
             document.getElementById('currentTemp').textContent = `${nowTemp.toFixed(2)} °C`;
+            checkTemperatureAlarm(nowTemp);
             statusEl.textContent = "Aika synkronoitu. Ladataan mittaushistoriaa...";
             return;
           }
 
-          // 2. Lopetuspaketti historialataukselle (2 tavua: 0xFF, 0xFF) -> Jätetään yhteys auki live-tilaan!
+          // Lopetuspaketti
           if (dv.byteLength === 2 && dv.getUint8(0) === 0xFF && dv.getUint8(1) === 0xFF) {
             rawRecords.sort((a, b) => a.x - b.x);
-            statusEl.textContent = `Live-tila päällä! Ladattu ${rawRecords.length} mittausta. Uudet mittaukset päivittyvät automaattisesti.`;
+            statusEl.textContent = `Live-tila päällä! Ladattu ${rawRecords.length} mittausta.`;
             updateStats();
             renderChart();
             document.getElementById('btnCsv').style.display = 'inline-block';
@@ -233,13 +403,15 @@
             return;
           }
 
-          // 3. Yksittäinen live-mittaus (7 tavua: 0xBB, uint32 timestamp, int16 temp)
+          // Live-mittaus (0xBB)
           if (dv.byteLength === 7 && dv.getUint8(0) === 0xBB) {
             const liveEpoch = dv.getUint32(1, true);
             const liveTemp = dv.getInt16(5, true) / 100.0;
             const liveDate = new Date(liveEpoch * 1000);
 
             document.getElementById('currentTemp').textContent = `${liveTemp.toFixed(2)} °C`;
+            checkTemperatureAlarm(liveTemp);
+
             rawRecords.push({ x: liveDate, y: liveTemp });
             updateStats();
 
@@ -249,16 +421,15 @@
             } else {
               renderChart();
             }
-            statusEl.textContent = `Live-päivitys vastaanotettu klo ${liveDate.toLocaleTimeString('fi-FI')} (${liveTemp.toFixed(2)} °C). Yhteensä ${rawRecords.length} mittausta.`;
+            statusEl.textContent = `Live-päivitys klo ${liveDate.toLocaleTimeString('fi-FI')} (${liveTemp.toFixed(2)} °C). Yhteensä ${rawRecords.length} mittausta.`;
             return;
           }
 
-          // 4. Historiapaketit (7 tavua per tietue: uint32 timestamp, int16 temp, uint8 isSynced)
+          // Historiapaketit
           for (let offset = 0; offset + 7 <= dv.byteLength; offset += 7) {
             const recEpoch = dv.getUint32(offset, true);
             const recTemp = dv.getInt16(offset + 4, true) / 100.0;
-            const timestamp = new Date(recEpoch * 1000);
-            rawRecords.push({ x: timestamp, y: recTemp });
+            rawRecords.push({ x: new Date(recEpoch * 1000), y: recTemp });
           }
           statusEl.textContent = `Vastaanotettu ${rawRecords.length} mittausta...`;
         });
@@ -271,7 +442,6 @@
       }
     });
 
-    // Muistin tyhjennys suoraan aktiivisen yhteyden yli (tai yhdistämällä)
     document.getElementById('btnClear').addEventListener('click', async () => {
       if (!confirm("Haluatko varmasti tyhjentää koko mittaushistorian ESP32-kortin muistista?")) return;
       const statusEl = document.getElementById('status');
@@ -279,7 +449,6 @@
         if (bleDevice && bleDevice.gatt.connected && ctrlCharacteristic) {
           await ctrlCharacteristic.writeValue(new TextEncoder().encode("CLEAR"));
         } else {
-          statusEl.textContent = "Yhdistetään muistin tyhjennystä varten...";
           const device = await navigator.bluetooth.requestDevice({
             filters: [{ name: 'ESP32-TempLogger' }],
             optionalServices: [SERVICE_UUID]
@@ -290,7 +459,6 @@
           await ctrlChar.writeValue(new TextEncoder().encode("CLEAR"));
           device.gatt.disconnect();
         }
-
         rawRecords = [];
         if (chart) chart.destroy();
         chart = null;
@@ -339,26 +507,17 @@
         options: {
           responsive: true,
           maintainAspectRatio: false,
-          interaction: {
-            mode: 'index',
-            intersect: false
-          },
+          interaction: { mode: 'index', intersect: false },
           scales: {
             x: {
               type: 'time',
               time: {
                 tooltipFormat: 'dd.MM.yyyy HH:mm:ss',
-                displayFormats: {
-                  minute: 'HH:mm',
-                  hour: 'dd.MM. HH:mm',
-                  day: 'dd.MM.yyyy'
-                }
+                displayFormats: { minute: 'HH:mm', hour: 'dd.MM. HH:mm', day: 'dd.MM.yyyy' }
               },
               title: { display: true, text: 'Aika' }
             },
-            y: {
-              title: { display: true, text: 'Lämpötila (°C)' }
-            }
+            y: { title: { display: true, text: 'Lämpötila (°C)' } }
           }
         }
       });
@@ -367,8 +526,7 @@
     document.getElementById('btnCsv').addEventListener('click', () => {
       let csv = "Aikaleima;Lampotila_C\n";
       for (const r of rawRecords) {
-        const localTime = r.x.toLocaleString('fi-FI');
-        csv += `${localTime};${r.y.toFixed(2).replace('.', ',')}\n`;
+        csv += `${r.x.toLocaleString('fi-FI')};${r.y.toFixed(2).replace('.', ',')}\n`;
       }
       const blob = new Blob(["\uFEFF" + csv], { type: 'text/csv;charset=utf-8;' });
       const link = document.createElement("a");
