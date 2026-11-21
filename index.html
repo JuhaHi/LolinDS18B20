@@ -106,7 +106,7 @@
     <div id="status">Yhdistetään Supabase-pilvitietokantaan...</div>
   </div>
 
-  <!-- ASETUKSET-PANEELI (piilotettu oletuksena, aukeaa napista) -->
+  <!-- ASETUKSET-PANEELI -->
   <div class="card" id="settingsPanel" style="display:none;">
     <div class="settings-grid">
       <!-- 1. ESP32 Wi-Fi-asetukset BLE:n yli -->
@@ -160,8 +160,8 @@
 
   <script>
     // --- TÄYTÄ SUPABASE-PROJEKTISI TIEDOT ---
-    const SUPABASE_URL = "https://qxcwahoggbdbbrklnrrf.supabase.co";
-    const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF4Y3dhaG9nZ2JkYmJya2xucnJmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTUyMjc4MjUsImV4cCI6MjExMDgwMzgyNX0.ONqn5SLIf2j-7mDXoGPVinVFviiUdL62CmzoEh8K5Oc";
+    const SUPABASE_URL = "https://OMA_PROJEKTI.supabase.co";
+    const SUPABASE_KEY = "OMA_SUPABASE_ANON_PUBLIC_KEY";
 
     // BLE UUID:t
     const SERVICE_UUID   = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
@@ -171,10 +171,15 @@
     let rawRecords = [];
     let chart = null;
     let swRegistration = null;
+    let lastKnownId = 0;
 
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('sw.js').then(reg => swRegistration = reg).catch(() => {});
     }
+
+    // Esitäytä viimeksi tallennettu Wi-Fi-verkon nimi selaimen muistista
+    const wifiSsidEl = document.getElementById('wifiSsid');
+    wifiSsidEl.value = localStorage.getItem('savedWifiSsid') || '';
 
     // Asetuspaneelin avaus/sulkeminen
     document.getElementById('btnToggleSettings').addEventListener('click', () => {
@@ -214,7 +219,7 @@
 
     // Tallenna Wi-Fi ESP32-kortin NVS-muistiin
     document.getElementById('btnSaveWifi').addEventListener('click', async () => {
-      const ssid = document.getElementById('wifiSsid').value.trim();
+      const ssid = wifiSsidEl.value.trim();
       const pass = document.getElementById('wifiPass').value;
       if (!ssid) {
         document.getElementById('bleStatus').textContent = "Syötä Wi-Fi-verkon nimi (SSID).";
@@ -222,10 +227,13 @@
       }
       const btn = document.getElementById('btnSaveWifi');
       btn.disabled = true;
-      await sendBleCommand(
+      const ok = await sendBleCommand(
         `WIFI:${ssid}|${pass}`,
         `✅ Wi-Fi-asetukset ('${ssid}') tallennettu ESP32-kortin muistiin! Kortti yhdistää verkkoon.`
       );
+      if (ok) {
+        localStorage.setItem('savedWifiSsid', ssid);
+      }
       btn.disabled = false;
     });
 
@@ -305,12 +313,38 @@
       }
     });
 
+    // Käsittele yksittäinen uusi mittausrivi (Realtime tai poll)
+    function handleNewRow(row, isLiveUpdate = false) {
+      if (row.id && row.id <= lastKnownId) return;
+      if (row.id) lastKnownId = row.id;
+
+      const pt = { x: new Date(row.measured_at), y: row.temperature };
+      rawRecords.push(pt);
+      rawRecords.sort((a, b) => a.x - b.x);
+
+      document.getElementById('currentTemp').textContent = `${pt.y.toFixed(2)} °C`;
+      document.getElementById('lastSampleTime').textContent = pt.x.toLocaleString('fi-FI');
+      checkTemperatureAlarm(pt.y);
+
+      updateStats();
+      if (chart) {
+        chart.data.datasets[0].data = rawRecords;
+        chart.data.datasets[0].pointRadius = rawRecords.length > 400 ? 0 : 2.5;
+        chart.update('none');
+      } else {
+        renderChart();
+      }
+      if (isLiveUpdate) {
+        document.getElementById('status').textContent = `Live-päivitys pilvestä klo ${pt.x.toLocaleTimeString('fi-FI')} (${pt.y.toFixed(2)} °C). Yhteensä ${rawRecords.length} mittausta.`;
+      }
+    }
+
     // 1. Lataa olemassa oleva historia Supabasesta
     async function loadHistory() {
       const statusEl = document.getElementById('status');
       const { data, error } = await db
         .from('measurements')
-        .select('measured_at, temperature')
+        .select('id, measured_at, temperature')
         .order('measured_at', { ascending: false })
         .limit(2000);
 
@@ -319,12 +353,14 @@
         return;
       }
 
-      rawRecords = data.reverse().map(row => ({
+      const sorted = data.reverse();
+      rawRecords = sorted.map(row => ({
         x: new Date(row.measured_at),
         y: row.temperature
       }));
 
-      if (rawRecords.length > 0) {
+      if (sorted.length > 0) {
+        lastKnownId = sorted[sorted.length - 1].id || 0;
         const latest = rawRecords[rawRecords.length - 1];
         document.getElementById('currentTemp').textContent = `${latest.y.toFixed(2)} °C`;
         document.getElementById('lastSampleTime').textContent = latest.x.toLocaleString('fi-FI');
@@ -336,29 +372,26 @@
       statusEl.textContent = `Pilviyhteys aktiivinen! Ladattu ${rawRecords.length} mittausta. Uudet mittaukset päivittyvät automaattisesti.`;
     }
 
-    // 2. Kuuntele reaaliaikaisia päivityksiä Supabasesta
+    // 2. Tarkista uudet rivit 15 sekunnin välein (varayhteys jos WebSocket katkeaa)
+    async function pollNewRecords() {
+      const { data, error } = await db
+        .from('measurements')
+        .select('id, measured_at, temperature')
+        .gt('id', lastKnownId)
+        .order('id', { ascending: true });
+
+      if (!error && data && data.length > 0) {
+        for (const row of data) {
+          handleNewRow(row, true);
+        }
+      }
+    }
+
+    // 3. Kuuntele reaaliaikaisia päivityksiä Supabasesta
     function subscribeRealtime() {
       db.channel('measurements-live')
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'measurements' }, (payload) => {
-          const row = payload.new;
-          const pt = { x: new Date(row.measured_at), y: row.temperature };
-
-          rawRecords.push(pt);
-          rawRecords.sort((a, b) => a.x - b.x);
-
-          document.getElementById('currentTemp').textContent = `${pt.y.toFixed(2)} °C`;
-          document.getElementById('lastSampleTime').textContent = pt.x.toLocaleString('fi-FI');
-          checkTemperatureAlarm(pt.y);
-
-          updateStats();
-          if (chart) {
-            chart.data.datasets[0].data = rawRecords;
-            chart.data.datasets[0].pointRadius = rawRecords.length > 400 ? 0 : 2.5;
-            chart.update('none');
-          } else {
-            renderChart();
-          }
-          document.getElementById('status').textContent = `Live-päivitys pilvestä klo ${pt.x.toLocaleTimeString('fi-FI')} (${pt.y.toFixed(2)} °C).`;
+          handleNewRow(payload.new, true);
         })
         .subscribe();
     }
@@ -426,8 +459,10 @@
       link.click();
     });
 
-    loadHistory();
-    subscribeRealtime();
+    loadHistory().then(() => {
+      subscribeRealtime();
+      setInterval(pollNewRecords, 15000);
+    });
   </script>
 </body>
 </html>
